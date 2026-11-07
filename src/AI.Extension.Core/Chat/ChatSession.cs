@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using AI.Extension.Mcp;
 using Microsoft.Extensions.AI;
+using ModelContextProtocol;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -193,13 +194,10 @@ public sealed class ChatSession
 
             foreach (FunctionCallContent call in functionCalls)
             {
-                AiToolCallTrace trace = await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false);
-                traces.Add(trace);
-                ToolCallCompleted?.Invoke(trace);
-
-                messages.Add(new ChatMessage(
-                    ChatRole.Tool,
-                    new List<AIContent> { new FunctionResultContent(call.CallId, BuildToolPayload(trace)) }));
+                ToolInvocation invocation = await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false);
+                traces.Add(invocation.Trace);
+                ToolCallCompleted?.Invoke(invocation.Trace);
+                messages.Add(invocation.ResultMessage);
             }
         }
 
@@ -269,13 +267,10 @@ public sealed class ChatSession
 
             foreach (FunctionCallContent call in functionCalls)
             {
-                AiToolCallTrace trace = await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false);
-                traces.Add(trace);
-                ToolCallCompleted?.Invoke(trace);
-
-                messages.Add(new ChatMessage(
-                    ChatRole.Tool,
-                    new List<AIContent> { new FunctionResultContent(call.CallId, BuildToolPayload(trace)) }));
+                ToolInvocation invocation = await InvokeToolAsync(call, cancellationToken).ConfigureAwait(false);
+                traces.Add(invocation.Trace);
+                ToolCallCompleted?.Invoke(invocation.Trace);
+                messages.Add(invocation.ResultMessage);
             }
         }
 
@@ -403,7 +398,7 @@ public sealed class ChatSession
             traces.Count == 0 ? null : string.Join(" → ", traces.Select(static trace => trace.ToolName)));
     }
 
-    private async Task<AiToolCallTrace> InvokeToolAsync(FunctionCallContent call, CancellationToken cancellationToken)
+    private async Task<ToolInvocation> InvokeToolAsync(FunctionCallContent call, CancellationToken cancellationToken)
     {
         string argumentsJson = call.Arguments is null
             ? "{}"
@@ -415,12 +410,11 @@ public sealed class ChatSession
         if (tool is null)
         {
             string available = string.Join(", ", _bridge.Tools.Select(static t => t.Name));
-            return new AiToolCallTrace(
-                call.Name,
+            return CreateToolInvocation(
+                call,
                 argumentsJson,
-                Success: false,
-                ResultPreview: $"工具不存在。可用工具：{available}",
-                Duration: TimeSpan.Zero);
+                CreateToolError($"工具不存在。可用工具：{available}"),
+                TimeSpan.Zero);
         }
 
         var stopwatch = Stopwatch.StartNew();
@@ -435,10 +429,7 @@ public sealed class ChatSession
 
             stopwatch.Stop();
 
-            bool success = result.IsError is not true;
-            string text = ExtractText(result);
-
-            return new AiToolCallTrace(call.Name, argumentsJson, success, Truncate(text), stopwatch.Elapsed);
+            return CreateToolInvocation(call, argumentsJson, result, stopwatch.Elapsed);
         }
         catch (OperationCanceledException)
         {
@@ -447,27 +438,38 @@ public sealed class ChatSession
         catch (Exception exception)
         {
             stopwatch.Stop();
-            return new AiToolCallTrace(
-                call.Name,
+            return CreateToolInvocation(
+                call,
                 argumentsJson,
-                Success: false,
-                ResultPreview: exception.Message,
-                Duration: stopwatch.Elapsed);
+                CreateToolError(exception.Message),
+                stopwatch.Elapsed);
         }
     }
 
-    private static string BuildToolPayload(AiToolCallTrace trace)
-        => (trace.Success ? "OK: " : "ERROR: ") + trace.ResultPreview;
+    // 模型使用 SDK 转换的完整结果（含 isError / structuredContent / 全部内容块）。
+    // 截断只用于 UI 与会话文件的轨迹，不能再把 ResultPreview 当作执行结果回灌。
+    private static ToolInvocation CreateToolInvocation(
+        FunctionCallContent call,
+        string argumentsJson,
+        CallToolResult result,
+        TimeSpan duration)
+        => new(
+            new AiToolCallTrace(call.Name, argumentsJson, result.IsError is not true, Truncate(ExtractText(result)), duration),
+            result.ToChatMessage(call.CallId));
+
+    private static CallToolResult CreateToolError(string message)
+        => new()
+        {
+            IsError = true,
+            Content = [new TextContentBlock { Text = message }],
+        };
+
+    private sealed record ToolInvocation(AiToolCallTrace Trace, ChatMessage ResultMessage);
 
     private static string ExtractText(CallToolResult result)
     {
-        if (result.Content is null || result.Content.Count == 0)
-        {
-            return string.Empty;
-        }
-
         var builder = new StringBuilder();
-        foreach (ContentBlock block in result.Content)
+        foreach (ContentBlock block in result.Content ?? [])
         {
             if (block is TextContentBlock text)
             {
@@ -480,7 +482,8 @@ public sealed class ChatSession
             }
         }
 
-        return builder.ToString().Trim();
+        string preview = builder.ToString().Trim();
+        return preview.Length > 0 ? preview : result.StructuredContent?.GetRawText() ?? string.Empty;
     }
 
     private static string Truncate(string value)

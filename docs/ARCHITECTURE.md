@@ -89,6 +89,16 @@ Button.Click → AsyncRelayCommand → OrdersViewModel.CancelAsync()
 写入类工具最终都落到同一个 `OrdersViewModel`，因此 **AI 修改数据后 WPF 表格/Blazor 页面会同步刷新**；
 WPF 表格下方的「新增 / 编辑订单」表单直接调用同一批 ViewModel 方法，人类与 Agent 两条路径行为一致。
 
+### 2.2.2 工具结果与错误语义
+
+- **模型载荷不等于展示摘要**：普通、流式以及不支持流式时的回退路径均通过 SDK 的 `CallToolResult.ToChatMessage(callId)` 回灌完整 MCP 结果，保留 `isError`、`structuredContent` 和全部内容块；不再用 `ResultPreview` 拼接 `OK:` / `ERROR:`。
+- **轨迹只负责展示与持久化**：`AiToolCallTrace.ResultPreview` 仍限制为 400 字符（超限追加省略号）。纯结构化结果用其 JSON 生成预览；持久化工具轨迹不保存完整载荷。
+- **业务失败在 MCP 边界标记**：Demo 的 `ToolOutcome<T>.ToCallToolResult()` 保留原有 `success/value/error` JSON，失败时额外设置 MCP 工具结果的 `isError=true`。内置会话、stdio 和 HTTP 客户端看到相同的失败状态，不仅依赖正文中的 `success=false`。
+- **框架不猜业务 DTO**：`ChatSession` 的成功标志以 `CallToolResult.IsError` 为准，不解析任意工具 JSON 中的同名字段。接入新工具时，应在工具封装层把业务失败转换为 MCP 错误结果。
+- **取消不是业务失败**：会话的 `OperationCanceledException` 继续向上传播，不转成普通工具结果让模型继续执行。
+
+兼容性：Demo 工具名称、输入参数及业务 JSON 字段保持不变；`OrderTools` 的 C# 方法返回类型改为 `Task<CallToolResult>`，直接调用这些示例方法的代码需要适配。业务契约 `IOrderService` 不变。
+
 ### 2.3 进程内 MCP 的建立顺序
 
 1. `McpServerBridge` 创建两对内存管道（`System.IO.Pipelines`）；
